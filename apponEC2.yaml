@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: EC2 for App
+Parameters:
+  environment:
+    Type: String
+    AllowedValues:
+      - shared
+      - dev
+      - qa
+      - stage
+      - prod
+  product:
+    Type: String
+    AllowedValues:
+      - test-env
+    Default: test-env
+  service:
+    Type: String
+    AllowedValues:
+      - app
+    Default: app
+  keyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Default: shared-test-env-key-pair 
+  instanceTypeForNodes:
+    Description: Instance Type For app Servers
+    Type: String
+    AllowedValues:
+    - m5.large
+    - t1.micro
+    - t2.nano
+    - t2.micro
+    - t2.medium
+    - t2.large
+  ec2RootVolumeSize:
+    Description: RootVolumeSize minimum value is 30 GB
+    Type: Number
+    MinValue: 30
+  AMI:
+    Description: Ubuntu Image ID 
+    Type: String
+    Default: ami-0885b1f6bd170450c
+  scheme:
+    Type: String
+    Default: internet-facing
+  minSize:
+    Type: String
+    Default: 3
+  desiredSize:
+    Type: String
+    Default: 3
+  maxSize:
+    Type: String
+    Default: 5
+Mappings:
+  config:
+    shared:
+      minSize: 2
+      maxSize: 2
+      desiredSize: 2
+      instanceType: t2.medium
+    qa:
+      minSize: 3
+      maxSize: 6
+      desiredSize: 3
+      instanceType: m5.large
+    stage:
+      minSize: 4
+      maxSize: 20
+      desiredSize: 4
+      instanceType: m5.2xlarge
+    prod:
+      minSize: 4
+      maxSize: 20
+      desiredSize: 4
+      instanceType: m5.2xlarge    
+Resources:
+  instanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref iamRole
+  iamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${environment}-${product}-app-iam-role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: 
+       -      "arn:aws:iam::aws:policy/AdministratorAccess"
+  app:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: app Security Group 
+      VpcId: !ImportValue 
+        'Fn::Sub': '${environment}-${product}-vpc'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 22
+          ToPort: 22
+      Tags:
+          -
+            Key: Name
+            Value: !Sub ${environment}-${product}-${service}-app 
+  sgRuleforApp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    DependsOn: 'app'
+    Description: Security Group for App
+    Properties:
+      GroupId: !Ref  app
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+  nodeGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    DependsOn: nodeLaunchConfig
+    Properties:
+      DesiredCapacity: !FindInMap [config, !Ref environment, desiredSize]
+      LaunchConfigurationName: !Ref nodeLaunchConfig
+      MinSize: !FindInMap [config, !Ref environment, minSize]
+      MaxSize: !FindInMap [config, !Ref environment, maxSize]
+      VPCZoneIdentifier: 
+        - !ImportValue 
+          'Fn::Sub': '${environment}-${product}-vpc-public-subnet-a'
+        - !ImportValue 
+          'Fn::Sub': '${environment}-${product}-vpc-public-subnet-b'
+      TargetGroupARNs:
+        - !Ref appTg      
+      Tags:
+        - Key: Name
+          Value: !Sub '${environment}-${product}-${service}'
+          PropagateAtLaunch: 'true'
+  nodeLaunchConfig:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      AssociatePublicIpAddress: true
+      ImageId: !Ref AMI
+      InstanceType: !FindInMap [config, !Ref environment, instanceType]
+      IamInstanceProfile: !Ref instanceProfile
+      KeyName: !Ref keyName
+      SecurityGroups: 
+        - !Ref  app
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:  
+            VolumeSize: !Ref ec2RootVolumeSize
+            VolumeType: gp2
+            DeleteOnTermination: true
+      UserData: !Base64
+          'Fn::Sub': >
+            #!/bin/bash
+            
+            apt update -y
+
+            apt install -y git awscli nodejs npm
+
+            curl -L -O https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-6.6.2-amd64.deb | bash 
+
+            dpkg -i filebeat-6.6.2-amd64.deb && rm -rf filebeat-6.6.2-amd64.deb && rm -rf /etc/filebeat/filebeat.yml
+
+            touch /etc/filebeat/filebeat.yml
+
+            cat <<<'filebeat:
+              inputs:
+                - type: log
+                  enabled: true
+                  paths:
+                    - /var/log/*.log
+                  close_inactive: 48h
+            output:
+              elasticsearch:
+                hosts: ["vpc-elk-elasticsea-1kmtenhq2q5wc-ua3rthwssx5xa6t7kaa5ckthnq.us-east-1.es.amazonaws.com:80"]
+            ' >> /etc/filebeat/filebeat.yml
+
+            mkdir -p /home/ubuntu/app
+
+            git clone https://github.com/foothill9402/test-app.git /home/ubuntu/app
+
+            cd /home/ubuntu/app/ && npm install
+
+            npm install -g pm2
+
+            pm2 --name HelloWorld start npm -- start
+
+            nohup filebeat -e -c /etc/filebeat/filebeat.yml & 
+
+  serviceScaleUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref nodeGroup
+      Cooldown: '60'
+      ScalingAdjustment: '1'
+  serviceScaleDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref nodeGroup
+      Cooldown: '60'
+      ScalingAdjustment: '-1'
+  cpuAlarmHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Scale-up
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '75'
+      AlarmActions:
+        - !Ref serviceScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref nodeGroup
+      ComparisonOperator: GreaterThanThreshold
+  cpuAlarmLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Scale-down
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '25'
+      AlarmActions:
+        - !Ref serviceScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref nodeGroup
+      ComparisonOperator: LessThanThreshold      
+  albSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Sub '${environment}-${product}-${service}'
+      GroupName: !Sub '${environment}-${product}-${service}'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      VpcId: !ImportValue 
+        'Fn::Sub': '${environment}-${product}-vpc'
+      Tags:
+        - Key: Name
+          Value: !Sub '${environment}-${product}-${service}'
+  albSGself:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    DependsOn: albSG
+    Properties:
+      GroupId: !Ref albSG
+      IpProtocol: '-1'
+      FromPort: '0'
+      ToPort: '65535'
+      SourceSecurityGroupId: !Ref albSG
+  alb:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: !Sub '${environment}-${product}-${service}-alb'
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref albSG
+      Subnets:
+        - !ImportValue 
+          'Fn::Sub': '${environment}-${product}-vpc-public-subnet-a'
+        - !ImportValue 
+          'Fn::Sub': '${environment}-${product}-vpc-public-subnet-b'
+  appTg:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: 200-299
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      HealthCheckTimeoutSeconds: 10
+      HealthCheckIntervalSeconds: 60
+      Name: !Sub '${environment}-${product}-${service}-tg-default'
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !ImportValue 
+        'Fn::Sub': '${environment}-${product}-vpc'
+      TargetType: instance
+  defaultTgListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref appTg
+      LoadBalancerArn: !Ref alb
+      Port: 80
+      Protocol: HTTP
+  AlbTgListenerRule:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref appTg
+                Weight: 100
+      ListenerArn: !Ref defaultTgListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /
+Outputs:
+  sgId:
+    Description: The IDs of the security groups for the application load balancer.
+    Value: !GetAtt 
+      - albSG
+      - GroupId
+    Export:
+      Name: !Sub '${environment}-${product}-${service}-sg'
+  LoadBalancerName:
+    Description: The name of the application load balancer.
+    Value: !Ref alb
+    Export:
+      Name: !Sub '${environment}-${product}-${service}'
+  defaultTglistenerArn:
+    Value: !Ref defaultTgListener
+    Export:
+      Name: !Sub '${environment}-${product}-${service}-alb-tg-listener'
+  appTg:
+    Value: !Ref appTg
+    Export:
+      Name: !Sub ${environment}-${product}-${service}-alb-default-tg

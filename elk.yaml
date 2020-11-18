@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ElasticsearchDomain resource
+Parameters:
+  environment:
+    Type: String
+    AllowedValues:
+      - shared
+      - dev
+      - qa
+      - stage
+      - prod
+  product:
+    Type: String
+    Default: test-env
+  service:
+    Type: String
+    Default: elk
+  elasticSearchVersion:
+    Type: String
+    AllowedValues:
+      - '7.1'
+      - '6.8'
+      - '6.7'
+      - '6.5'
+      - '6.4'
+    Default: '6.4'
+  ebsVolumeSize:
+    Type: Number
+    AllowedValues:
+      - '35'
+      - '100'
+      - '150'
+      - '200'
+      - '500'
+    Default: '35'
+  instanceType:
+    Type: String
+    AllowedValues:
+      - t2.small.elasticsearch
+      - t2.medium.elasticsearch
+      - m4.xlarge.elasticsearch
+      - m4.2xlarge.elasticsearch
+    Default: t2.small.elasticsearch
+  instanceCount:
+    Type: Number
+    MinValue: 2
+    Default: 2
+Resources:
+  # esServiceLinkedRole:
+  #   Type: 'AWS::IAM::ServiceLinkedRole'
+  #   Properties:
+  #     AWSServiceName: es.amazonaws.com
+  #     Description: Service Linked Role for Elasticsearch
+  ElasticsearchDomain:
+    # DependsOn: esServiceLinkedRole
+    Type: 'AWS::Elasticsearch::Domain'
+    Properties:
+      ElasticsearchVersion: !Ref elasticSearchVersion
+      ElasticsearchClusterConfig:
+        InstanceCount: !Ref instanceCount
+        ZoneAwarenessEnabled: 'true'
+        InstanceType: !Ref instanceType
+      EBSOptions:
+        EBSEnabled: 'true'
+        Iops: 0
+        VolumeSize: !Ref ebsVolumeSize
+        VolumeType: gp2
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: '0'
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: 'es:*'
+            Resource: '*'
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${environment}-${product}-${service}'
+      VPCOptions:
+        SubnetIds:
+          - !ImportValue 
+            'Fn::Sub': '${environment}-${product}-vpc-public-subnet-a'
+          - !ImportValue 
+            'Fn::Sub': '${environment}-${product}-vpc-public-subnet-b'
+        SecurityGroupIds:
+          - !ImportValue 
+            'Fn::Sub': '${environment}-${product}-vpc-generalSG'

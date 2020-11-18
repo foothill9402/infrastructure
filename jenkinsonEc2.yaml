@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: EC2 Jenkins Server Preconfigured with Plugins and a Completed Setup
+Mappings:
+  RegionMap:
+    us-east-1:
+      HVM64: ami-0ac019f4fcb7cb7e6
+      ARM64: ami-01ac7d9c1179d7b74
+    us-east-2:
+      HVM64: ami-0f65671a86f061fcd
+      ARM64: ami-0f2057f28f0a44d06
+    us-west-1:
+      HVM64: ami-063aa838bd7631e0b
+    us-west-2:
+      HVM64: ami-0bbe6b35405ecebdb
+      ARM64: ami-0db180c518750ee4f
+    ap-south-1:
+      HVM64: ami-0d773a3b7bb2bb1c1
+Parameters:
+  environment:
+    Type: String
+    AllowedValues:
+      - shared
+    Default: shared
+  product:
+    Type: String
+    AllowedValues:
+      - test-env
+    Default: test-env
+  service:
+    Type: String
+    AllowedValues:
+      - jenkins
+    Default: jenkins
+  keyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Default: shared-test-env-key-pair
+  instanceType:
+    Description: InstanceType
+    Type: String
+    Default: t3.medium
+  ec2RootVolumeSize:
+    Description: RootVolumeSize minimum value is 30 GB
+    Type: Number
+    MinValue: 30
+    Default: 100
+Resources:
+  iamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${environment}-${product}-jenkins-iam-role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Sub '${environment}-${product}-jenkins-iam-role-policy'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 'secretsmanager:GetRandomPassword'
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:DescribeSecret'
+                  - 'ssm:DescribeParameters'
+                  - 'ssm:GetParametersByPath'
+                  - 'ssm:GetParameters'
+                  - 'secretsmanager:ListSecrets'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:PutImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ec2:*'
+                  - 'ecs:*'
+                  - 'route53:*'
+                  - 'cloudfront:*'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - 'sts:AssumeRole'
+                Resource:
+                  - >-
+                    arn:aws:iam::557587840296:role/shared-rivittv-jenkins-assumable-role
+                Effect: Allow
+  instanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref iamRole
+  ec2Instance:
+    Type: 'AWS::EC2::Instance'
+    # CreationPolicy:
+    #   ResourceSignal:
+    #     Timeout: PTM
+    Properties:
+      KeyName: !Ref keyName
+      InstanceType: !Ref instanceType
+      ImageId: !FindInMap 
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - HVM64
+      IamInstanceProfile: !Ref instanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: 'true'
+          DeviceIndex: '0'
+          GroupSet:
+            - !ImportValue 
+              'Fn::Sub': '${environment}-${product}-vpc-generalSG'
+          SubnetId: !ImportValue 
+            'Fn::Sub': '${environment}-${product}-vpc-public-subnet-a'
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: 'true'
+            VolumeSize: !Ref ec2RootVolumeSize
+      UserData: !Base64 
+        'Fn::Sub': >
+          #!/bin/bash
+
+          set -e
+
+          # trap sendSuccessSignal EXIT
+
+          # trap sendFailureSignal ERR
+
+          # sendFailureSignal() {
+          #   echo "Something Bad Happened ... cleaning up."
+          #   cfn-signal -e 1 --stack ${AWS::StackName} --resource ec2Instance --region ${AWS::Region}
+          #   echo "Signal Sent .... Nothing To Do Sport!!!!"
+          #   exit 1
+          # }
+
+          # sendSuccessSignal() {
+          #   echo "Everything Is Good .... Sending Success Signal"
+          #   cfn-signal -e 0 --stack ${AWS::StackName} --resource ec2Instance --region ${AWS::Region}
+          #   echo "Signal Sent .... Nothing To Do Sport!!!!"
+          #   exit 0
+          # }
+
+          echo "\n\nDisabling Firewall\n\n"
+
+          ufw disable
+
+          echo "\n\nInstalling Various Packages Required By Jenkins And
+          Subsequent Runs\n\n"
+
+          wget -q -O - https://pkg.jenkins.io/debian/jenkins.io.key | apt-key
+          add -
+
+          sh -c 'echo deb http://pkg.jenkins.io/debian-stable binary/ >
+          /etc/apt/sources.list.d/jenkins.list'
+
+          DEBIAN_FRONTEND=noninteractive apt-key adv --keyserver
+          keyserver.ubuntu.com --recv-keys 9B7D32F2D50582E6
+
+          DEBIAN_FRONTEND=noninteractive apt-get update -y
+
+          DEBIAN_FRONTEND=noninteractive apt-get install python-pip git jq
+          openjdk-8-jdk apt-transport-https ca-certificates curl
+          software-properties-common nginx -y
+
+          pip install awscli
+
+          pip install
+          https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add
+          -
+
+          add-apt-repository "deb [arch=amd64]
+          https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+
+          DEBIAN_FRONTEND=noninteractive apt-get update -y
+
+          DEBIAN_FRONTEND=noninteractive apt install docker-ce jenkins -y
+
+          echo "\n\nSetting Up Correct Docker Access To The Jenkins & Ubuntu
+          User\n\n"
+
+          usermod -aG docker jenkins
+
+          usermod -aG docker ubuntu
+
+          echo "\n\nInstalling Docker Compose\n\n"
+
+          curl -L
+          "https://github.com/docker/compose/releases/download/1.23.1/docker-compose-$(uname
+          -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+
+          chmod +x /usr/local/bin/docker-compose
+
+          echo "\n\nInstalling Chef Client\n\n"
+
+          curl -L https://omnitruck.chef.io/install.sh | bash
+
+          echo "\n\nSetting Up Nginx Reverse Proxy\n\n"
+
+          cat <<<' server {
+            listen 80;
+            listen [::]:80;
+            server_name localhost;
+            location / {
+                proxy_pass http://localhost:8080/;
+            }
+          }' > /etc/nginx/sites-available/default
+
+          echo "\n\n\Begin Jenkins Setupn\n"
+
+          service jenkins start
+
+          echo "\n\nAwait Initial Password Being Available\n\n"
+
+          until $(curl -s -m 60 -o /dev/null -I -f -u "admin:$(cat
+          /var/lib/jenkins/secrets/initialAdminPassword)"
+          http://localhost:8080/cli/); do printf "."; sleep 1; done
+
+          echo "\n\nSet Master Label\n\n"
+
+          sed -i -e "s@<label>.*</label>@<label>master</label>@"
+          /var/lib/jenkins/config.xml
+
+          echo "\n\nRestarting Jenkins\n\n"
+
+          service jenkins restart
+
+          echo "\n\nAwait Initial Password Being Available\n\n"
+
+          until $(curl -s -m 60 -o /dev/null -I -f -u "admin:$(cat
+          /var/lib/jenkins/secrets/initialAdminPassword)"
+          http://localhost:8080/cli/); do printf "."; sleep 1; done
+
+          echo "\n\nInstall Plugins on Jenkins\n\n"
+
+          cat <<< '
+            pipeline-graph-analysis
+            aws-java-sdk
+            jquery-detached
+            github
+            workflow-scm-step
+            matrix-project
+            pipeline-input-step
+            workflow-api
+            ace-editor
+            pipeline-build-step
+            git
+            jackson2-api
+            pipeline-model-extensions
+            momentjs
+            pipeline-stage-step
+            docker-workflow
+            mapdb-api
+            display-url-api
+            structs
+            ant
+            plain-credentials
+            workflow-multibranch
+            workflow-aggregator
+            workflow-cps-global-lib
+            pipeline-stage-view
+            pipeline-milestone-step
+            jdk-tool
+            ssh-slaves
+            bouncycastle-api
+            subversion
+            handlebars
+            docker-commons
+            matrix-auth
+            aws-credentials
+            mailer
+            pipeline-stage-tags-metadata
+            timestamper
+            mercurial
+            ssh-credentials
+            handy-uri-templates-2-api
+            jsch
+            workflow-job
+            credentials
+            pipeline-model-declarative-agent
+            ldap
+            command-launcher
+            durable-task
+            pipeline-model-definition
+            git-client
+            pipeline-rest-api
+            lockable-resources
+            cloudbees-folder
+            bitbucket
+            junit
+            github-branch-source
+            gradle
+            workflow-step-api
+            workflow-durable-task-step
+            scm-api
+            ws-cleanup
+            branch-api
+            pipeline-aws
+            github-api
+            resource-disposer
+            workflow-cps
+            apache-httpcomponents-client-4-api
+            pam-auth
+            token-macro
+            authentication-tokens
+            git-server
+            pipeline-github-lib
+            folder-properties
+            pipeline-model-api
+            credentials-binding
+            pipeline-utility-steps
+            email-ext
+            workflow-basic-steps
+            script-security
+            cloudbees-bitbucket-branch-source
+            variant
+            build-timeout
+            antisamy-markup-formatter
+            workflow-support
+          ' > /root/plugins.txt
+
+          curl -o /var/cache/jenkins/war/WEB-INF/jenkins-cli.jar
+          http://localhost:8080/jnlpJars/jenkins-cli.jar
+
+          java -jar /var/cache/jenkins/war/WEB-INF/jenkins-cli.jar -s
+          "http://localhost:8080/" -auth "admin:$(cat
+          /var/lib/jenkins/secrets/initialAdminPassword)" install-plugin $(cat
+          /root/plugins.txt | tr "\n" " ")
+
+          echo "\n\nCreating Users & Setting Temporary Password to ==>
+          changemenow \n\n"
+
+          echo
+          'jenkins.model.Jenkins.instance.securityRealm.createAccount("devops",
+          "changemenow")' | java -jar
+          /var/cache/jenkins/war/WEB-INF/jenkins-cli.jar -s
+          "http://localhost:8080/" -auth "admin:$(cat
+          /var/lib/jenkins/secrets/initialAdminPassword)" groovy =
+
+          echo
+          'jenkins.model.Jenkins.instance.securityRealm.createAccount("admin",
+          "changemenow")' | java -jar
+          /var/cache/jenkins/war/WEB-INF/jenkins-cli.jar -s
+          "http://localhost:8080/" -auth "admin:$(cat
+          /var/lib/jenkins/secrets/initialAdminPassword)" groovy =
+
+          service jenkins restart
+
+          service nginx restart
+
+          systemctl enable jenkins nginx
+      Tags:
+        - Key: Name
+          Value: !Sub '${environment}-${product}-${service}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${environment}-${product}-${service}'
